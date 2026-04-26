@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hello-world Rust Lambda with a tower-based DynamoDB rate limit middleware.
+
+Parameters:
+  MaxRequests:
+    Type: Number
+    Default: 10
+    Description: Maximum requests per client IP per window.
+  WindowSecs:
+    Type: Number
+    Default: 900
+    Description: Rate limit window in seconds (default 900 = 15 minutes).
+
+Globals:
+  Function:
+    Timeout: 5
+    MemorySize: 128
+    Architectures:
+      - arm64
+
+Resources:
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  HelloFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-hello
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Environment:
+        Variables:
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+          RATE_LIMIT_MAX_REQUESTS: !Ref MaxRequests
+          RATE_LIMIT_WINDOW_SECS: !Ref WindowSecs
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+      Events:
+        Hello:
+          Type: HttpApi
+          Properties:
+            Path: /
+            Method: get
+
+Outputs:
+  HelloApi:
+    Description: Invoke URL for the hello endpoint.
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/
+  RateLimitTableName:
+    Description: DynamoDB table used by the rate limit middleware.
+    Value: !Ref RateLimitTable
