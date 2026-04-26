@@ -39,6 +39,22 @@ for i in (seq 1 12); curl -i $URL; end
 
 The first 10 requests should return `200` with decrementing `RateLimit-Remaining`. The 11th returns `429` with `Retry-After`.
 
+## Composing additional middleware
+
+Tower layers stack, so adding more middleware is just another `.layer(...)` on the builder. For example, with `tower-http` you could add CORS in front of the rate limiter:
+
+```rust
+use lambda_http::tower::ServiceBuilder;
+use tower_http::cors::CorsLayer;
+
+let service = ServiceBuilder::new()
+    .layer(CorsLayer::permissive())  // outer: runs first on the way in, last on the way out
+    .layer(rate_limit)                // inner: the middleware in this repo
+    .service(service_fn(handler));
+```
+
+This snippet is illustrative — `tower-http` is not a dependency of this crate. The point is that the same `Layer`/`Service` traits used to write the rate limiter compose with anything else in the Tower ecosystem.
+
 ## License
 
 MIT

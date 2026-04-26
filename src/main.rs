@@ -1,6 +1,6 @@
-use lambda_http::{run, tracing, Body, Error, Request, Response};
+use lambda_http::tower::ServiceBuilder;
+use lambda_http::{run, service_fn, tracing, Body, Error, Request, Response};
 use serde_json::json;
-use tower::{service_fn, ServiceBuilder};
 
 mod ip_extractor;
 mod rate_limit;
@@ -46,5 +46,8 @@ async fn main() -> Result<(), Error> {
         .layer(rate_limit)
         .service(service_fn(handler));
 
+    // For Lambda Managed Instances, swap `run` for `lambda_http::run_concurrent`
+    // and enable the `concurrency-tokio` feature on `lambda_http`. On classic
+    // Lambda (AWS_LAMBDA_MAX_CONCURRENCY <= 1) the two behave identically.
     run(service).await
 }

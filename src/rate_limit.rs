@@ -13,6 +13,7 @@
 //! On breach we return a plain JSON `429` with `Retry-After`.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -20,11 +21,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use http::{HeaderValue, Response};
+use lambda_http::tower::{Layer, Service};
 use lambda_http::{tracing, Body};
 use serde::Serialize;
-use tower::{Layer, Service};
+use tracing::Instrument;
 
 use crate::ip_extractor::extract_ip;
+
+/// Information passed to a custom over-limit response builder.
+#[allow(dead_code)] // public extension surface; binary crate has no in-tree consumer
+pub struct OverLimitCtx {
+    pub ip: IpAddr,
+    pub limit: u32,
+    pub reset_at: u64,
+    pub retry_after: u64,
+}
+
+type OverLimitFn = Arc<dyn Fn(OverLimitCtx) -> Response<Body> + Send + Sync>;
+type UnavailableFn = Arc<dyn Fn() -> Response<Body> + Send + Sync>;
 
 /// Static, cheap-to-clone configuration for [`RateLimitLayer`].
 #[derive(Clone)]
@@ -39,6 +53,8 @@ pub struct RateLimitConfig {
 pub struct RateLimitLayer {
     config: Arc<RateLimitConfig>,
     client: aws_sdk_dynamodb::Client,
+    over_limit: OverLimitFn,
+    unavailable: UnavailableFn,
 }
 
 impl RateLimitLayer {
@@ -46,7 +62,29 @@ impl RateLimitLayer {
         Self {
             config: Arc::new(config),
             client,
+            over_limit: Arc::new(default_over_limit_response),
+            unavailable: Arc::new(default_unavailable_response),
         }
+    }
+
+    /// Override the response returned when a client is over the limit.
+    #[allow(dead_code)] // public extension surface; binary crate has no in-tree consumer
+    pub fn on_over_limit<F>(mut self, f: F) -> Self
+    where
+        F: Fn(OverLimitCtx) -> Response<Body> + Send + Sync + 'static,
+    {
+        self.over_limit = Arc::new(f);
+        self
+    }
+
+    /// Override the response returned when the counter store is unreachable.
+    #[allow(dead_code)] // public extension surface; binary crate has no in-tree consumer
+    pub fn on_unavailable<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Response<Body> + Send + Sync + 'static,
+    {
+        self.unavailable = Arc::new(f);
+        self
     }
 }
 
@@ -61,6 +99,8 @@ impl<S> Layer<S> for RateLimitLayer {
             inner,
             store,
             config: Arc::clone(&self.config),
+            over_limit: Arc::clone(&self.over_limit),
+            unavailable: Arc::clone(&self.unavailable),
         }
     }
 }
@@ -72,6 +112,8 @@ pub struct RateLimitService<S> {
     inner: S,
     store: Arc<dyn RateLimitStore>,
     config: Arc<RateLimitConfig>,
+    over_limit: OverLimitFn,
+    unavailable: UnavailableFn,
 }
 
 impl<S> Service<http::Request<Body>> for RateLimitService<S>
@@ -91,50 +133,68 @@ where
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let config = Arc::clone(&self.config);
         let store = Arc::clone(&self.store);
+        let over_limit = Arc::clone(&self.over_limit);
+        let unavailable = Arc::clone(&self.unavailable);
 
         // Extract everything we need from the request up front, because
         // `inner.call(request)` consumes it by move.
-        let ip = extract_ip(&request).map(|ip| ip.to_string());
+        let ip = extract_ip(&request);
 
         let inner_future = self.inner.call(request);
 
-        Box::pin(async move {
-            let Some(ip) = ip else {
-                // No identifiable client: fail open so we don't lock out
-                // legitimate traffic when a misbehaving proxy drops headers.
-                tracing::warn!("rate_limit: could not determine client IP, allowing request");
-                return inner_future.await;
-            };
+        Box::pin(
+            async move {
+                let Some(ip) = ip else {
+                    // No identifiable client: fail open so we don't lock out
+                    // legitimate traffic when a misbehaving proxy drops headers.
+                    tracing::warn!("rate_limit: could not determine client IP, allowing request");
+                    return inner_future.await;
+                };
 
-            let now = current_epoch_secs();
-            let window = config.window_secs.max(1);
-            let bucket = now / window;
-            let reset_at = bucket.saturating_add(1).saturating_mul(window);
-            let seconds_until_reset = reset_at.saturating_sub(now);
+                let now = current_epoch_secs();
+                let window = config.window_secs.max(1);
+                let bucket = now / window;
+                let reset_at = bucket.saturating_add(1).saturating_mul(window);
+                let seconds_until_reset = reset_at.saturating_sub(now);
 
-            let pk = format!("{ip}#{bucket}");
-            // Keep the row for one extra window so late-arriving requests in
-            // the same bucket still observe a consistent counter.
-            let ttl = reset_at.saturating_add(window);
+                let pk = format!("{ip}#{bucket}");
+                // Keep the row for one extra window so late-arriving requests in
+                // the same bucket still observe a consistent counter.
+                let ttl = reset_at.saturating_add(window);
 
-            let count = match store.increment_and_get(&config.table_name, &pk, ttl).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "rate_limit: DynamoDB error");
-                    return Ok(build_500_response());
+                let span = tracing::info_span!("rate_limit", ip = %ip, window = bucket);
+
+                async move {
+                    let count = match store.increment_and_get(&config.table_name, &pk, ttl).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "rate_limit: DynamoDB error");
+                            // Fail closed: block traffic when the counter store is
+                            // unreachable rather than silently letting requests bypass.
+                            return Ok(unavailable());
+                        }
+                    };
+
+                    let limit = config.max_requests;
+                    tracing::debug!(count, limit, "rate_limit decision");
+                    if count > limit {
+                        return Ok(over_limit(OverLimitCtx {
+                            ip,
+                            limit,
+                            reset_at,
+                            retry_after: seconds_until_reset,
+                        }));
+                    }
+
+                    let mut response = inner_future.await?;
+                    let remaining = limit.saturating_sub(count);
+                    append_rate_limit_headers(response.headers_mut(), limit, remaining, reset_at);
+                    Ok(response)
                 }
-            };
-
-            let limit = config.max_requests;
-            if count > limit {
-                return Ok(build_429_response(limit, reset_at, seconds_until_reset));
-            }
-
-            let mut response = inner_future.await?;
-            let remaining = limit.saturating_sub(count);
-            append_rate_limit_headers(response.headers_mut(), limit, remaining, reset_at);
-            Ok(response)
-        })
+                .instrument(span)
+                .await
+            },
+        )
     }
 }
 
@@ -168,32 +228,30 @@ struct RateLimitErrorBody<'a> {
     retry_after: u64,
 }
 
-fn build_429_response(limit: u32, reset_at: u64, seconds_until_reset: u64) -> Response<Body> {
+fn default_over_limit_response(ctx: OverLimitCtx) -> Response<Body> {
     let body = serde_json::to_string(&RateLimitErrorBody {
         error: "rate limit exceeded",
-        retry_after: seconds_until_reset,
+        retry_after: ctx.retry_after,
     })
     .unwrap_or_else(|_| r#"{"error":"rate limit exceeded"}"#.to_string());
 
     Response::builder()
         .status(429)
         .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .header("retry-after", seconds_until_reset.to_string())
-        .header("RateLimit-Limit", limit.to_string())
+        .header("Retry-After", ctx.retry_after.to_string())
+        .header("RateLimit-Limit", ctx.limit.to_string())
         .header("RateLimit-Remaining", "0")
-        .header("RateLimit-Reset", reset_at.to_string())
+        .header("RateLimit-Reset", ctx.reset_at.to_string())
         .body(body.into())
         .expect("valid 429 response")
 }
 
-fn build_500_response() -> Response<Body> {
+fn default_unavailable_response() -> Response<Body> {
     Response::builder()
-        .status(500)
+        .status(503)
         .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .body(r#"{"error":"internal server error"}"#.into())
-        .expect("valid 500 response")
+        .body(r#"{"error":"service unavailable"}"#.into())
+        .expect("valid 503 response")
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +307,11 @@ impl RateLimitStore for DynamoDbRateLimitStore {
             .and_then(|attrs| attrs.get("calls"))
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(1);
+            .ok_or_else(|| {
+                RateLimitStoreError::DynamoDb(
+                    "missing or invalid 'calls' attribute in UpdateItem response".to_string(),
+                )
+            })?;
 
         Ok(count)
     }
@@ -262,6 +324,8 @@ impl<S> RateLimitService<S> {
             inner,
             store,
             config,
+            over_limit: Arc::new(default_over_limit_response),
+            unavailable: Arc::new(default_unavailable_response),
         }
     }
 }
@@ -270,9 +334,9 @@ impl<S> RateLimitService<S> {
 mod tests {
     use super::*;
     use http::{Request, StatusCode};
+    use lambda_http::tower::ServiceExt;
     use std::convert::Infallible;
     use std::sync::Mutex;
-    use tower::ServiceExt;
 
     struct MockRateLimitStore {
         counters: Mutex<std::collections::HashMap<String, u32>>,
@@ -342,7 +406,7 @@ mod tests {
     async fn under_limit_calls_inner_service() {
         let config = test_config(10);
         let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::new());
-        let service = RateLimitService::with_store(tower::service_fn(ok_handler), store, config);
+        let service = RateLimitService::with_store(lambda_http::tower::service_fn(ok_handler), store, config);
 
         let response = service
             .oneshot(request_with_ip("203.0.113.1"))
@@ -361,7 +425,7 @@ mod tests {
         let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::new());
 
         let service = RateLimitService::with_store(
-            tower::service_fn(ok_handler),
+            lambda_http::tower::service_fn(ok_handler),
             Arc::clone(&store),
             Arc::clone(&config),
         );
@@ -371,14 +435,14 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let service = RateLimitService::with_store(tower::service_fn(ok_handler), store, config);
+        let service = RateLimitService::with_store(lambda_http::tower::service_fn(ok_handler), store, config);
         let second = service
             .oneshot(request_with_ip("203.0.113.2"))
             .await
             .unwrap();
 
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(second.headers().contains_key("retry-after"));
+        assert!(second.headers().contains_key("Retry-After"));
         assert_eq!(second.headers().get("RateLimit-Remaining").unwrap(), "0");
     }
 
@@ -388,7 +452,7 @@ mod tests {
         let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::new());
 
         let service = RateLimitService::with_store(
-            tower::service_fn(ok_handler),
+            lambda_http::tower::service_fn(ok_handler),
             Arc::clone(&store),
             Arc::clone(&config),
         );
@@ -398,7 +462,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let service = RateLimitService::with_store(tower::service_fn(ok_handler), store, config);
+        let service = RateLimitService::with_store(lambda_http::tower::service_fn(ok_handler), store, config);
         let second = service
             .oneshot(request_with_ip("203.0.113.20"))
             .await
@@ -407,24 +471,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamodb_error_returns_500() {
+    async fn dynamodb_error_returns_503() {
         let config = test_config(10);
         let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::failing());
-        let service = RateLimitService::with_store(tower::service_fn(ok_handler), store, config);
+        let service = RateLimitService::with_store(lambda_http::tower::service_fn(ok_handler), store, config);
 
         let response = service
             .oneshot(request_with_ip("203.0.113.30"))
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Default 503 deliberately omits Retry-After; users can add one via on_unavailable.
+        assert!(!response.headers().contains_key("Retry-After"));
+    }
+
+    #[tokio::test]
+    async fn custom_over_limit_response_is_used() {
+        let config = test_config(1);
+        let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::new());
+
+        let mut service = RateLimitService::with_store(
+            lambda_http::tower::service_fn(ok_handler),
+            Arc::clone(&store),
+            Arc::clone(&config),
+        );
+        service.over_limit = Arc::new(|ctx: OverLimitCtx| {
+            Response::builder()
+                .status(StatusCode::IM_A_TEAPOT)
+                .header("X-Limit", ctx.limit.to_string())
+                .body(Body::from("custom"))
+                .unwrap()
+        });
+
+        let _ = ServiceExt::oneshot(&mut service, request_with_ip("203.0.113.40"))
+            .await
+            .unwrap();
+        let response = service
+            .oneshot(request_with_ip("203.0.113.40"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(response.headers().get("X-Limit").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn custom_unavailable_response_is_used() {
+        let config = test_config(10);
+        let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::failing());
+        let mut service = RateLimitService::with_store(
+            lambda_http::tower::service_fn(ok_handler),
+            store,
+            config,
+        );
+        service.unavailable = Arc::new(|| {
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("upstream down"))
+                .unwrap()
+        });
+
+        let response = service
+            .oneshot(request_with_ip("203.0.113.41"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn missing_ip_falls_through_to_inner() {
         let config = test_config(1);
         let store: Arc<dyn RateLimitStore> = Arc::new(MockRateLimitStore::new());
-        let service = RateLimitService::with_store(tower::service_fn(ok_handler), store, config);
+        let service = RateLimitService::with_store(lambda_http::tower::service_fn(ok_handler), store, config);
 
         let request = Request::builder()
             .method("GET")
