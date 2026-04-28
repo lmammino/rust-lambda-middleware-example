@@ -1,11 +1,14 @@
+//! Hello-world Lambda that wires up the [`RateLimitLayer`] from this
+//! crate's library.
+//!
+//! Build with `sam build`, deploy with `sam deploy --guided`. See the
+//! repo `README.md` for the full walkthrough.
+
 use lambda_http::tower::ServiceBuilder;
 use lambda_http::{run, service_fn, tracing, Body, Error, Request, Response};
 use serde_json::json;
 
-mod ip_extractor;
-mod rate_limit;
-
-use rate_limit::{RateLimitConfig, RateLimitLayer};
+use rust_lambda_middleware_example::{RateLimitConfig, RateLimitLayer};
 
 async fn handler(_request: Request) -> Result<Response<Body>, Error> {
     let body = json!({ "message": "hello, rusty middleware" }).to_string();

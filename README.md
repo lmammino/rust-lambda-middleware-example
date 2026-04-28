@@ -14,11 +14,38 @@ A minimal AWS Lambda in Rust that shows how to build reusable middleware with [t
 
 ```
 src/
-  main.rs          - hello-world handler wired with ServiceBuilder
-  ip_extractor.rs  - client IP extraction (X-Forwarded-For / X-Real-IP / CF-Connecting-IP)
-  rate_limit.rs    - Tower Layer + Service with DynamoDB-backed counter
-template.yaml      - SAM template (DynamoDB table + Lambda + HTTP API)
+  lib.rs                  - library entry point; re-exports the rate limiter
+  ip_extractor.rs         - client IP extraction (X-Forwarded-For / X-Real-IP / CF-Connecting-IP)
+  rate_limit.rs           - Tower Layer + Service with DynamoDB-backed counter
+  bin/
+    hello.rs              - deployable hello-world handler wired with ServiceBuilder
+examples/
+  noop_layer.rs           - the bare-minimum tower middleware shape
+  log_layer.rs            - logs HTTP method, path, and response status
+  powered_by_layer.rs     - injects an x-powered-by response header
+  error_recovery.rs       - intercepts inner-service errors and returns a 503
+template.yaml             - SAM template (DynamoDB table + Lambda + HTTP API)
 ```
+
+The rate limiter and the IP extractor live in the library crate
+(`src/lib.rs`), so the deployable Lambda (`src/bin/hello.rs`) and any
+external consumer can `use rust_lambda_middleware_example::*;`.
+
+## Run an example
+
+The `examples/` directory ships the smaller middleware patterns from the
+post as standalone runnable demos:
+
+```sh
+cargo run --example noop_layer
+cargo run --example log_layer
+cargo run --example powered_by_layer
+cargo run --example error_recovery
+```
+
+Each one builds a tiny `ServiceBuilder` stack, fires a synthetic request
+through it with `tower::ServiceExt::oneshot`, and prints the response.
+No AWS credentials needed.
 
 ## Build and deploy
 

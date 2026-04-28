@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Companion code for the blog post 'Writing middlewares for Rust Lambda functions' (loige.co)"
 
-[[bin]]
-name = "hello"
-path = "src/main.rs"
-
 [dependencies]
 lambda_http = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
