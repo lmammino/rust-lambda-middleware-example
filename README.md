@@ -20,11 +20,14 @@ src/
   bin/
     hello.rs              - deployable hello-world handler wired with ServiceBuilder
 examples/
-  noop_layer.rs           - the bare-minimum tower middleware shape
-  log_layer.rs            - logs HTTP method, path, and response status
-  powered_by_layer.rs     - injects an x-powered-by response header
-  error_recovery.rs       - intercepts inner-service errors and returns a 503
-template.yaml             - SAM template (DynamoDB table + Lambda + HTTP API)
+  noop_layer.rs                 - the bare-minimum tower middleware shape
+  log_layer_request_only.rs     - log layer evolution, stage 1: pre-request log only
+  log_layer_broken.rs           - log layer evolution, stage 2: naive attempt that does NOT compile
+  log_layer_manual_poll.rs      - log layer evolution, stage 3: hand-rolled Future
+  log_layer.rs                  - log layer evolution, stage 4: idiomatic Box::pin(async move)
+  powered_by_layer.rs           - injects an x-powered-by response header
+  error_recovery.rs             - intercepts inner-service errors and returns a 503
+template.yaml                   - SAM template (DynamoDB table + Lambda + HTTP API)
 ```
 
 The rate limiter and the IP extractor live in the library crate
@@ -38,6 +41,8 @@ post as standalone runnable demos:
 
 ```sh
 cargo run --example noop_layer
+cargo run --example log_layer_request_only
+cargo run --example log_layer_manual_poll
 cargo run --example log_layer
 cargo run --example powered_by_layer
 cargo run --example error_recovery
@@ -46,6 +51,20 @@ cargo run --example error_recovery
 Each one builds a tiny `ServiceBuilder` stack, fires a synthetic request
 through it with `tower::ServiceExt::oneshot`, and prints the response.
 No AWS credentials needed.
+
+The four `log_layer_*` files walk through the evolution from a trivial
+no-op-with-a-log-line to the idiomatic `Box::pin(async move { … })` shape;
+the article walks through them in order. The middle stage,
+`log_layer_broken.rs`, is intentionally not compilable, so it is gated
+behind the `intentionally-broken` Cargo feature. To reproduce the
+failure for yourself:
+
+```sh
+cargo build --example log_layer_broken --features intentionally-broken
+```
+
+Expected output: an `error[E0728]: 'await' is only allowed inside 'async'
+functions and blocks`. That error is the whole point of the file.
 
 ## Build and deploy
 

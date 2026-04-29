@@ -14,3 +14,17 @@ async-trait = "0.1"
 thiserror = "2"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1"
+pin-project-lite = "0.2"
+
+# `log_layer_broken` is intentionally broken: it shows the naive log middleware
+# attempt that fails to compile. Gated behind a feature so the default build
+# stays clean. Reproduce the failure with:
+#
+#     cargo build --example log_layer_broken --features intentionally-broken
+[features]
+intentionally-broken = []
+
+[[example]]
+name = "log_layer_broken"
+path = "examples/log_layer_broken.rs"
+required-features = ["intentionally-broken"]
