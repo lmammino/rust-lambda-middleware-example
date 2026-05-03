@@ -1,30 +1,3 @@
-[package]
-name = "rust-lambda-middleware-example"
-version = "0.1.0"
-edition = "2021"
-description = "Companion code for the blog post 'Writing middlewares for Rust Lambda functions' (loige.co)"
-
-[dependencies]
-lambda_http = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-http = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-async-trait = "0.1"
-thiserror = "2"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1"
-pin-project-lite = "0.2"
-
-# `log_layer_broken` is intentionally broken: it shows the naive log middleware
-# attempt that fails to compile. Gated behind a feature so the default build
-# stays clean. Reproduce the failure with:
-#
-#     cargo build --example log_layer_broken --features intentionally-broken
-[features]
-intentionally-broken = []
-
-[[example]]
-name = "log_layer_broken"
-path = "examples/log_layer_broken.rs"
-required-features = ["intentionally-broken"]
+[workspace]
+resolver = "2"
+members = ["library", "lambdas/hello"]

@@ -4,19 +4,16 @@
 //! Build with `sam build`, deploy with `sam deploy --guided`. See the
 //! repo `README.md` for the full walkthrough.
 
+use std::time::Duration;
+
 use lambda_http::tower::ServiceBuilder;
-use lambda_http::{run, service_fn, tracing, Body, Error, Request, Response};
-use serde_json::json;
+use lambda_http::{run, service_fn, tracing, Error};
+use tower_http::cors::CorsLayer;
 
 use rust_lambda_middleware_example::{RateLimitConfig, RateLimitLayer};
 
-async fn handler(_request: Request) -> Result<Response<Body>, Error> {
-    let body = json!({ "message": "hello, rusty middleware" }).to_string();
-    Ok(Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(body.into())?)
-}
+mod http_handler;
+use http_handler::function_handler;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -35,22 +32,28 @@ async fn main() -> Result<(), Error> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(900);
+    let window_duration = Duration::from_secs(window_secs);
 
     let rate_limit = RateLimitLayer::new(
         RateLimitConfig {
             table_name,
             max_requests,
-            window_secs,
+            window_duration,
         },
         dynamodb_client,
     );
 
+    // CorsLayer sits on the outside so even rate-limited 429s carry
+    // the right CORS headers, and the rate limiter sits between it
+    // and the handler so the handler stays focused on business logic.
     let service = ServiceBuilder::new()
+        .layer(CorsLayer::permissive())
         .layer(rate_limit)
-        .service(service_fn(handler));
+        .service(service_fn(function_handler));
 
-    // For Lambda Managed Instances, swap `run` for `lambda_http::run_concurrent`
-    // and enable the `concurrency-tokio` feature on `lambda_http`. On classic
-    // Lambda (AWS_LAMBDA_MAX_CONCURRENCY <= 1) the two behave identically.
+    // For Lambda Managed Instances with PerExecutionEnvironmentMaxConcurrency
+    // > 1, swap `run` for `lambda_http::run_concurrent` and enable the
+    // `concurrency-tokio` feature on `lambda_http`. For classic Lambda (one
+    // event per execution environment) the two behave identically.
     run(service).await
 }

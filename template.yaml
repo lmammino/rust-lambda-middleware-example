@@ -40,7 +40,7 @@ Resources:
       BuildMethod: rust-cargolambda
     Properties:
       FunctionName: !Sub ${AWS::StackName}-hello
-      CodeUri: .
+      CodeUri: lambdas/hello
       Handler: bootstrap
       Runtime: provided.al2023
       Environment:

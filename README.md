@@ -4,35 +4,44 @@ Companion code for the blog post [**Writing middlewares for Rust Lambda function
 
 A minimal AWS Lambda in Rust that shows how to build reusable middleware with [tower](https://crates.io/crates/tower) (the generic middleware engine that already underpins the Rust Lambda runtime). The worked example is a DynamoDB-backed IP rate limiter that:
 
-- keys requests on client IP (extracted with sensible header priority),
+- keys requests on the client IP read from the API Gateway request context (HTTP API v2 / REST v1; other integrations need a different extractor),
 - uses a fixed window configurable via `RATE_LIMIT_WINDOW_SECS`,
-- exposes standard `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` response headers,
+- exposes `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` response headers (GitHub-style, epoch-second reset),
 - returns a plain JSON `429` with `Retry-After` when the limit is exceeded,
 - uses a DynamoDB atomic counter with TTL-based cleanup.
 
 ## Layout
 
+The repo is a Cargo workspace with two members:
+
 ```
-src/
-  lib.rs                  - library entry point; re-exports the rate limiter
-  ip_extractor.rs         - client IP extraction (X-Forwarded-For / X-Real-IP / CF-Connecting-IP)
-  rate_limit.rs           - Tower Layer + Service with DynamoDB-backed counter
-  bin/
-    hello.rs              - deployable hello-world handler wired with ServiceBuilder
-examples/
-  noop_layer.rs                 - the bare-minimum tower middleware shape
-  log_layer_request_only.rs     - log layer evolution, stage 1: pre-request log only
-  log_layer_broken.rs           - log layer evolution, stage 2: naive attempt that does NOT compile
-  log_layer_manual_poll.rs      - log layer evolution, stage 3: hand-rolled Future
-  log_layer.rs                  - log layer evolution, stage 4: idiomatic Box::pin(async move)
-  powered_by_layer.rs           - injects an x-powered-by response header
-  error_recovery.rs             - intercepts inner-service errors and returns a 503
-template.yaml                   - SAM template (DynamoDB table + Lambda + HTTP API)
+Cargo.toml                          - virtual workspace
+template.yaml                       - SAM template (DynamoDB table + Lambda + HTTP API)
+library/                            - reusable middleware crate (package: rust-lambda-middleware-example)
+  Cargo.toml
+  src/
+    lib.rs                          - library entry point; re-exports the rate limiter
+    ip_extractor.rs                 - client IP extraction from API Gateway request context (HTTP API v2 / REST v1)
+    rate_limit.rs                   - Tower Layer + Service with DynamoDB-backed counter
+  examples/
+    noop_layer.rs                   - the bare-minimum tower middleware shape
+    log_layer_request_only.rs       - log layer evolution, stage 1: pre-request log only
+    log_layer_broken.rs             - log layer evolution, stage 2: naive attempt that does NOT compile
+    log_layer_manual_poll.rs        - log layer evolution, stage 3: hand-rolled Future
+    log_layer.rs                    - log layer evolution, stage 4: idiomatic Box::pin(async move)
+    powered_by_layer.rs             - injects an x-powered-by response header
+    error_recovery.rs               - intercepts inner-service errors and returns a 503
+lambdas/
+  hello/                            - deployable Lambda (package: hello)
+    Cargo.toml
+    src/
+      main.rs                       - runtime entry point: env config, service composition, lambda_http::run
+      http_handler.rs               - the HTTP handler function (cargo-lambda-style split)
 ```
 
-The rate limiter and the IP extractor live in the library crate
-(`src/lib.rs`), so the deployable Lambda (`src/bin/hello.rs`) and any
-external consumer can `use rust_lambda_middleware_example::*;`.
+The rate limiter and the IP extractor live in the `library` crate
+(`library/src/lib.rs`), so the deployable Lambda (`lambdas/hello/`) and
+any external consumer can `use rust_lambda_middleware_example::*;`.
 
 ## Run an example
 
@@ -83,7 +92,7 @@ After deploy, copy the `HelloApi` endpoint from the stack outputs, then:
 for i in (seq 1 12); curl -i $URL; end
 ```
 
-The first 10 requests should return `200` with decrementing `RateLimit-Remaining`. The 11th returns `429` with `Retry-After`.
+The first 10 requests should return `200` with decrementing `X-RateLimit-Remaining`. The 11th returns `429` with `Retry-After`.
 
 ## Composing additional middleware
 

@@ -1,14 +1,15 @@
 //! Per-IP rate-limiting middleware for Rust Lambda HTTP handlers.
 //!
 //! A fixed-window counter backed by DynamoDB. The primary key for each
-//! counter row is `"{ip}#{window_bucket}"` where `window_bucket = now / window_secs`.
+//! counter row is `"{ip}#{window_bucket}"` where `window_bucket = now / window_duration`.
 //! Rows carry a TTL so DynamoDB cleans them up for us.
 //!
-//! Response headers follow the IETF draft (unprefixed):
+//! Response headers follow the GitHub / Twitter convention, with
+//! `Reset` carrying a Unix epoch second:
 //!
-//! * `RateLimit-Limit`
-//! * `RateLimit-Remaining`
-//! * `RateLimit-Reset`
+//! * `X-RateLimit-Limit`
+//! * `X-RateLimit-Remaining`
+//! * `X-RateLimit-Reset`
 //!
 //! On breach we return a plain JSON `429` with `Retry-After`. When the
 //! counter store is unreachable we fail closed with a plain JSON `503`.
@@ -22,14 +23,13 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use http::{HeaderValue, Request, Response};
 use lambda_http::tower::{Layer, Service};
 use lambda_http::{tracing, Body};
 use serde::Serialize;
-use tracing::Instrument;
 
 use crate::ip_extractor::extract_ip;
 
@@ -62,7 +62,7 @@ pub type UnavailableFn =
 pub struct RateLimitConfig {
     pub table_name: String,
     pub max_requests: u32,
-    pub window_secs: u64,
+    pub window_duration: Duration,
 }
 
 /// Tower [`Layer`] that enforces a per-IP fixed-window rate limit.
@@ -180,7 +180,9 @@ where
             };
 
             let now = current_epoch_secs();
-            let window = config.window_secs.max(1);
+            // Clamp the window to at least one second; a zero-length window
+            // would divide by zero when computing the bucket below.
+            let window = config.window_duration.as_secs().max(1);
             let bucket = now / window;
             let reset_at = bucket.saturating_add(1).saturating_mul(window);
             let seconds_until_reset = reset_at.saturating_sub(now);
@@ -190,40 +192,34 @@ where
             // the same bucket still observe a consistent counter.
             let ttl = reset_at.saturating_add(window);
 
-            let span = tracing::info_span!("rate_limit", ip = %ip, window = bucket);
-
-            async move {
-                let count = match store.increment_and_get(&config.table_name, &pk, ttl).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(error = %e, "rate_limit: DynamoDB error");
-                        // Fail closed: build the default 503, then let the
-                        // configurable hook tweak it before sending.
-                        let pre_built = build_unavailable_response();
-                        return Ok(unavailable(&request_for_bailout, pre_built));
-                    }
-                };
-
-                let limit = config.max_requests;
-                tracing::debug!(count, limit, "rate_limit decision");
-                if count > limit {
-                    let ctx = OverLimitCtx {
-                        ip,
-                        limit,
-                        reset_at,
-                        retry_after: seconds_until_reset,
-                    };
-                    let pre_built = build_over_limit_response(&ctx);
-                    return Ok(over_limit(&request_for_bailout, pre_built, &ctx));
+            let count = match store.increment_and_get(&config.table_name, &pk, ttl).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(ip = %ip, window = bucket, error = %e, "rate_limit: DynamoDB error");
+                    // Fail closed: build the default 503, then let the
+                    // configurable hook tweak it before sending.
+                    let pre_built = build_unavailable_response();
+                    return Ok(unavailable(&request_for_bailout, pre_built));
                 }
+            };
 
-                let mut response = inner_future.await?;
-                let remaining = limit.saturating_sub(count);
-                append_rate_limit_headers(response.headers_mut(), limit, remaining, reset_at);
-                Ok(response)
+            let limit = config.max_requests;
+            tracing::debug!(ip = %ip, window = bucket, count, limit, "rate_limit decision");
+            if count > limit {
+                let ctx = OverLimitCtx {
+                    ip,
+                    limit,
+                    reset_at,
+                    retry_after: seconds_until_reset,
+                };
+                let pre_built = build_over_limit_response(&ctx);
+                return Ok(over_limit(&request_for_bailout, pre_built, &ctx));
             }
-            .instrument(span)
-            .await
+
+            let mut response = inner_future.await?;
+            let remaining = limit.saturating_sub(count);
+            append_rate_limit_headers(response.headers_mut(), limit, remaining, reset_at);
+            Ok(response)
         })
     }
 }
@@ -242,13 +238,13 @@ fn append_rate_limit_headers(
     reset_at: u64,
 ) {
     if let Ok(v) = HeaderValue::from_str(&limit.to_string()) {
-        headers.insert("RateLimit-Limit", v);
+        headers.insert("X-RateLimit-Limit", v);
     }
     if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
-        headers.insert("RateLimit-Remaining", v);
+        headers.insert("X-RateLimit-Remaining", v);
     }
     if let Ok(v) = HeaderValue::from_str(&reset_at.to_string()) {
-        headers.insert("RateLimit-Reset", v);
+        headers.insert("X-RateLimit-Reset", v);
     }
 }
 
@@ -269,9 +265,9 @@ fn build_over_limit_response(ctx: &OverLimitCtx) -> Response<Body> {
         .status(429)
         .header("content-type", "application/json")
         .header("Retry-After", ctx.retry_after.to_string())
-        .header("RateLimit-Limit", ctx.limit.to_string())
-        .header("RateLimit-Remaining", "0")
-        .header("RateLimit-Reset", ctx.reset_at.to_string())
+        .header("X-RateLimit-Limit", ctx.limit.to_string())
+        .header("X-RateLimit-Remaining", "0")
+        .header("X-RateLimit-Reset", ctx.reset_at.to_string())
         .body(body.into())
         .expect("valid 429 response")
 }
@@ -378,7 +374,12 @@ impl<S> RateLimitService<S> {
 mod tests {
     use super::*;
     use http::StatusCode;
+    use lambda_http::aws_lambda_events::apigw::{
+        ApiGatewayV2httpRequestContext, ApiGatewayV2httpRequestContextHttpDescription,
+    };
+    use lambda_http::request::RequestContext;
     use lambda_http::tower::ServiceExt;
+    use lambda_http::RequestExt;
     use std::convert::Infallible;
     use std::sync::Mutex;
 
@@ -425,17 +426,25 @@ mod tests {
         Arc::new(RateLimitConfig {
             table_name: "test-table".to_string(),
             max_requests: max,
-            window_secs: 60,
+            window_duration: Duration::from_secs(60),
         })
     }
 
     fn request_with_ip(ip: &str) -> Request<Body> {
-        Request::builder()
+        // extract_ip reads the source IP from the API Gateway
+        // request context, so the test request needs a populated
+        // ApiGatewayV2 context.
+        let mut http = ApiGatewayV2httpRequestContextHttpDescription::default();
+        http.source_ip = Some(ip.to_string());
+        let mut ctx = ApiGatewayV2httpRequestContext::default();
+        ctx.http = http;
+
+        let request = Request::builder()
             .method("GET")
             .uri("http://example.com/test")
-            .header("x-forwarded-for", ip)
             .body(Body::Empty)
-            .unwrap()
+            .unwrap();
+        request.with_request_context(RequestContext::ApiGatewayV2(ctx))
     }
 
     async fn ok_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
@@ -462,9 +471,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get("RateLimit-Limit").unwrap(), "10");
-        assert_eq!(response.headers().get("RateLimit-Remaining").unwrap(), "9");
-        assert!(response.headers().contains_key("RateLimit-Reset"));
+        assert_eq!(response.headers().get("X-RateLimit-Limit").unwrap(), "10");
+        assert_eq!(response.headers().get("X-RateLimit-Remaining").unwrap(), "9");
+        assert!(response.headers().contains_key("X-RateLimit-Reset"));
     }
 
     #[tokio::test]
@@ -495,7 +504,7 @@ mod tests {
 
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(second.headers().contains_key("Retry-After"));
-        assert_eq!(second.headers().get("RateLimit-Remaining").unwrap(), "0");
+        assert_eq!(second.headers().get("X-RateLimit-Remaining").unwrap(), "0");
     }
 
     #[tokio::test]
@@ -580,7 +589,7 @@ mod tests {
         // Status, body, and standard headers came from the pre-built response.
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().contains_key("Retry-After"));
-        assert_eq!(response.headers().get("RateLimit-Remaining").unwrap(), "0");
+        assert_eq!(response.headers().get("X-RateLimit-Remaining").unwrap(), "0");
         // The customiser only added one header.
         assert_eq!(
             response.headers().get("X-Custom-Header").unwrap(),
@@ -668,6 +677,6 @@ mod tests {
         let response = service.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         // No RateLimit-* headers, because we skipped the counter entirely.
-        assert!(!response.headers().contains_key("RateLimit-Limit"));
+        assert!(!response.headers().contains_key("X-RateLimit-Limit"));
     }
 }
