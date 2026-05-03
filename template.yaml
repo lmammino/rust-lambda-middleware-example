@@ -16,8 +16,6 @@ Globals:
   Function:
     Timeout: 5
     MemorySize: 128
-    Architectures:
-      - arm64
 
 Resources:
   RateLimitTable:
@@ -43,6 +41,8 @@ Resources:
       CodeUri: lambdas/hello
       Handler: bootstrap
       Runtime: provided.al2023
+      Architectures:
+        - arm64
       Environment:
         Variables:
           RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
